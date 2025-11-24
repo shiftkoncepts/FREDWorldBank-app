@@ -11,18 +11,19 @@ st.title("Client Risk Explorer – US vs Foreign 🌍")
 st.markdown(
     """
 Upload a client file or use the sample dataset.  
-Risk scores incorporate **FRED macro stress** for US clients and  
-use **NAICS codes** to group clients into economic sectors.
+
+**RiskScore = BaseRisk + FRED macro adjustment (US only) + World Bank–style country risk.**
+
+- **BaseRisk** = your internal client risk (DSO, AR, disputes, etc.)
+- **FRED macro** = US-wide macro stress factor
+- **WB_CountryRisk** = country risk score derived from World Bank data (you provide this as a column).
 """
 )
 
 # ---------- FRED integration ----------
 @st.cache_data
 def get_fred_macro():
-    """
-    Fetch macro indicators from FRED and create a simple 'macro stress' score.
-    You can refine this later depending on legal/pricing use cases.
-    """
+    """Fetch macro indicators from FRED and create a simple 'macro stress' score."""
     fred = Fred(api_key=st.secrets["FRED_API_KEY"])
 
     nfcfi = fred.get_series("NFCI")      # Chicago Fed National Financial Conditions Index
@@ -58,14 +59,8 @@ if uploaded is not None:
     else:
         df = pd.read_excel(uploaded)
 else:
-    st.sidebar.info("No file uploaded — using sample data.")
-    np.random.seed(0)
-    df = pd.DataFrame({
-        "Client": [f"Client {chr(65+i)}" for i in range(20)],
-        "Country": np.random.choice(["US", "UK", "DE", "CN", "BR"], size=20),
-        "NAICS": np.random.choice([2211, 3254, 4234, 5241, 5411, 5613], size=20),
-        "BaseRisk": np.random.uniform(0, 100, size=20)
-    })
+    st.sidebar.info("No file uploaded — using 10-client US/China sample with WB country risk.")
+    df = pd.read_csv("sample_clients_wb.csv")
 
 
 # ---------- NAICS to Sector Mapping ----------
@@ -111,7 +106,7 @@ def map_naics_to_sector(naics_code):
         return "Other / Unknown"
 
 
-required_cols = ["Client", "Country", "NAICS", "BaseRisk"]
+required_cols = ["Client", "Country", "NAICS", "BaseRisk", "WB_CountryRisk"]
 missing = [c for c in required_cols if c not in df.columns]
 if missing:
     st.error(f"Your data is missing required columns: {missing}")
@@ -129,7 +124,11 @@ if fred_data is not None:
 else:
     df["Macro_Adj"] = 0.0
 
-df["RiskScore"] = df["BaseRisk"] + df["Macro_Adj"]
+# Ensure WB_CountryRisk is numeric
+df["WB_CountryRisk"] = pd.to_numeric(df["WB_CountryRisk"], errors="coerce").fillna(0.0)
+
+# Final RiskScore
+df["RiskScore"] = df["BaseRisk"] + df["Macro_Adj"] + df["WB_CountryRisk"]
 
 
 # ---------- Filters ----------
@@ -170,9 +169,10 @@ with col2:
         st.info("FRED API key not configured.")
 
 with col3:
-    st.subheader("Macro Stress")
-    if fred_data:
-        st.metric("Macro Stress (demo)", f"{fred_data['macro_stress']:.3f}")
+    st.subheader("World Bank Country Risk")
+    if not filtered.empty:
+        avg_country_risk = filtered["WB_CountryRisk"].mean()
+        st.metric("Avg WB_CountryRisk", f"{avg_country_risk:.1f}")
     else:
         st.write("N/A")
 
