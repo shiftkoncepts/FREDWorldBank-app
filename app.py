@@ -23,13 +23,15 @@ Your file should contain:
 - `BaseRisk` – internal client risk score (0–100 or your own scale)  
 - One of: `NAICS` **or** `SIC` – industry classification  
 
-World Bank and FRED data are fetched live; no API key is needed for World Bank.
+World Bank and FRED data are fetched live.  
+You only need to configure `FRED_API_KEY` in Streamlit Secrets.
 """
 )
 
-# ------------- Helpers: country code normalization -------------
+# ===================== Helper: Country code normalization =====================
+
 def normalize_country_code(val: str):
-    """Convert various country strings to ISO2 if possible."""
+    """Convert various country strings to ISO2 codes when possible."""
     if pd.isna(val):
         return None
     s = str(val).strip().upper()
@@ -38,6 +40,7 @@ def normalize_country_code(val: str):
         "US": "US",
         "USA": "US",
         "UNITED STATES": "US",
+        "UNITED STATES OF AMERICA": "US",
         "CHINA": "CN",
         "P.R. CHINA": "CN",
         "PEOPLE'S REPUBLIC OF CHINA": "CN",
@@ -49,12 +52,15 @@ def normalize_country_code(val: str):
         return manual[s]
     if len(s) == 2:
         return s
-    return None  # unknown format; WB call will be skipped
+    # Unknown, we just skip WB for this
+    return None
 
 
-# ------------- FRED overall snapshot (for display only) -------------
+# ===================== FRED overall snapshot (for metrics) ====================
+
 @st.cache_data
 def get_fred_overall():
+    """Overall US macro snapshot (NFCI + Unemployment)."""
     fred = Fred(api_key=st.secrets["FRED_API_KEY"])
     nfcfi = fred.get_series("NFCI")      # Financial Conditions Index
     unrate = fred.get_series("UNRATE")   # Unemployment rate
@@ -64,7 +70,8 @@ def get_fred_overall():
     }
 
 
-# ------------- FRED sector-specific configuration -------------
+# ===================== FRED sector-specific configuration =====================
+
 FRED_SECTOR_INFO = {
     "Manufacturing":                        {"series": "INDPRO",   "good_high": True},   # Industrial production
     "Retail Trade":                         {"series": "RSXFS",    "good_high": True},   # Retail sales excl. autos
@@ -92,7 +99,7 @@ def get_sector_stress(series_id: str, good_high: bool) -> float:
     - Pull full series
     - Compute z-score of latest vs history
     - If good_high=True, invert sign so high level = low stress
-    - Cap to [-3, 3] and scale lightly
+    - Cap to [-3, 3] and scale lightly to about [-6, 6]
     """
     try:
         fred = Fred(api_key=st.secrets["FRED_API_KEY"])
@@ -107,25 +114,27 @@ def get_sector_stress(series_id: str, good_high: bool) -> float:
     last = s.iloc[-1]
     mean = s.mean()
     std = s.std()
+
     if std == 0 or pd.isna(std):
         return 0.0
 
     z = (last - mean) / std
     stress = -z if good_high else z
     stress = float(max(min(stress, 3.0), -3.0))  # cap
-    return stress * 2.0  # scale so adj is roughly -6 to +6
+    return stress * 2.0                          # scale
 
 
-# ------------- World Bank: fetch indicators & build country stress -------------
+# ===================== World Bank: indicators & country stress =================
+
 WB_INDICATORS = {
-    "gdp_growth":       "NY.GDP.MKTP.KD.ZG",   # GDP growth (%)
-    "inflation":        "FP.CPI.TOTL.ZG",      # Inflation (%)
-    "external_debt_gni":"DT.DOD.DECT.GN.ZS",   # External debt (% of GNI)
-    "pol_stability":    "PV.PSAV.PT",          # Political stability index (-2.5 to 2.5)
+    "gdp_growth":        "NY.GDP.MKTP.KD.ZG",   # GDP growth (%)
+    "inflation":         "FP.CPI.TOTL.ZG",      # Inflation (%)
+    "external_debt_gni": "DT.DOD.DECT.GN.ZS",   # External debt (% of GNI)
+    "pol_stability":     "PV.PSAV.PT",          # Political stability index (-2.5, 2.5)
 }
 
 def wb_latest_value(country_code: str, indicator: str):
-    """Fetch latest non-null value for a given WB indicator & country."""
+    """Fetch latest non-null WB indicator for a country, or NaN on failure."""
     url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}?format=json"
     try:
         r = requests.get(url, timeout=10)
@@ -146,12 +155,13 @@ def wb_latest_value(country_code: str, indicator: str):
                 continue
     return np.nan
 
+
 @st.cache_data
 def get_world_bank_country_stress(country_codes):
     """
     For each ISO2 country code, fetch WB indicators and compute a stress score.
 
-    Stress is a weighted combo of z-scores:
+    WB_Stress ~
       + inflation_z
       + external_debt_z
       - gdp_growth_z
@@ -173,7 +183,7 @@ def get_world_bank_country_stress(country_codes):
 
     wb_df = pd.DataFrame(rows)
 
-    # Compute z-scores for each metric across available countries
+    # Z-scores per metric
     for col in ["gdp_growth", "inflation", "external_debt_gni", "pol_stability"]:
         s = wb_df[col]
         mean = s.mean()
@@ -183,8 +193,6 @@ def get_world_bank_country_stress(country_codes):
         else:
             wb_df[col + "_z"] = (s - mean) / std
 
-    # Higher inflation/external_debt_z => more stress
-    # Higher gdp_growth_z / pol_stability_z => less stress
     wb_df["WB_Stress"] = (
         0.3 * wb_df["inflation_z"] +
         0.3 * wb_df["external_debt_gni_z"] +
@@ -192,20 +200,20 @@ def get_world_bank_country_stress(country_codes):
         0.2 * (-wb_df["pol_stability_z"])
     )
 
-    # Cap and scale a bit (roughly -6 to +6)
-    wb_df["WB_Stress"] = wb_df["WB_Stress"].clip(-3, 3) * 2.0
-
+    wb_df["WB_Stress"] = wb_df["WB_Stress"].clip(-3, 3) * 2.0  # approx [-6, 6]
     return wb_df[["CountryCode", "WB_Stress"]]
 
 
-# Try to get overall FRED snapshot
+# ===================== Load FRED overall snapshot =============================
+
 try:
     fred_overall = get_fred_overall()
 except Exception:
     fred_overall = None
 
 
-# ------------- File upload / sample fallback -------------
+# ===================== File upload / sample fallback ==========================
+
 st.sidebar.header("Data Source")
 
 uploaded = st.sidebar.file_uploader("Upload CSV or Excel client file", type=["csv", "xlsx"])
@@ -228,7 +236,8 @@ else:
     })
 
 
-# ------------- Sector mapping (NAICS or SIC) -------------
+# ===================== Sector mapping (NAICS or SIC) ==========================
+
 def sector_from_two_digit(code2: int) -> str:
     if 1 <= code2 <= 9 or 10 <= code2 <= 14 or 11 <= code2 <= 21:
         return "Natural Resources & Mining"
@@ -266,12 +275,14 @@ def sector_from_two_digit(code2: int) -> str:
 
 
 def infer_sector(row):
+    # Prefer NAICS if available
     if "NAICS" in row and not pd.isna(row["NAICS"]):
         try:
             code2 = int(str(int(row["NAICS"]))[:2])
             return sector_from_two_digit(code2)
         except Exception:
             pass
+    # Fallback to SIC
     if "SIC" in row and not pd.isna(row["SIC"]):
         try:
             code2 = int(str(int(row["SIC"]))[:2])
@@ -281,7 +292,8 @@ def infer_sector(row):
     return "Other / Unknown"
 
 
-# ------------- Validate minimum columns -------------
+# ===================== Validate required columns ==============================
+
 base_required = ["Client", "Country", "BaseRisk"]
 missing_basic = [c for c in base_required if c not in df.columns]
 if missing_basic:
@@ -292,14 +304,17 @@ if "NAICS" not in df.columns and "SIC" not in df.columns:
     st.error("Your data must contain either a `NAICS` column or a `SIC` column.")
     st.stop()
 
-# ------------- Derive sector, normalize types -------------
-df["Sector"] = df.apply(infer_sector, axis=1)
-df["CountryRaw"] = df["Country"].astype(str)
-df["CountryCode"] = df["CountryRaw"].apply(normalize_country_code)
 
+# ===================== Derive sector, normalize types =========================
+
+df["Sector"] = df.apply(infer_sector, axis=1)
+df["Country"] = df["Country"].astype(str)
+df["CountryCode"] = df["Country"].apply(normalize_country_code)
 df["BaseRisk"] = pd.to_numeric(df["BaseRisk"], errors="coerce").fillna(0.0)
 
-# ------------- World Bank: compute country stress and map to clients -------------
+
+# ===================== World Bank: country stress =============================
+
 unique_codes = sorted({c for c in df["CountryCode"].unique() if c is not None})
 if unique_codes:
     wb_df = get_world_bank_country_stress(unique_codes)
@@ -308,8 +323,11 @@ if unique_codes:
 else:
     df["WB_CountryRisk"] = 0.0
 
-# ------------- FRED sector macro: apply to US clients only -------------
+
+# ===================== FRED: sector macro for US clients ======================
+
 df["Macro_Adj"] = 0.0
+
 if fred_overall is not None:
     us_mask = df["CountryCode"] == "US"
     us_sectors = df.loc[us_mask, "Sector"].dropna().unique().tolist()
@@ -322,13 +340,17 @@ if fred_overall is not None:
         sector_adj[sector] = get_sector_stress(info["series"], info["good_high"])
     df.loc[us_mask, "Macro_Adj"] = df.loc[us_mask, "Sector"].map(sector_adj).fillna(0.0)
 
-# ------------- Final RiskScore -------------
+
+# ===================== Final RiskScore =======================================
+
 df["RiskScore"] = df["BaseRisk"] + df["Macro_Adj"] + df["WB_CountryRisk"]
 
-# ------------- Filters -------------
+
+# ===================== Filters ===============================================
+
 st.sidebar.header("Filters")
 
-all_countries = sorted(df["CountryRaw"].unique().tolist())
+all_countries = sorted(df["Country"].unique().tolist())
 selected_countries = st.sidebar.multiselect(
     "Countries",
     options=all_countries,
@@ -337,7 +359,7 @@ selected_countries = st.sidebar.multiselect(
 
 filtered = df.copy()
 if selected_countries:
-    filtered = filtered[filtered["CountryRaw"].isin(selected_countries)]
+    filtered = filtered[filtered["Country"].isin(selected_countries)]
 
 available_sectors = sorted(filtered["Sector"].dropna().unique().tolist())
 selected_sectors = st.sidebar.multiselect(
@@ -348,7 +370,9 @@ selected_sectors = st.sidebar.multiselect(
 if selected_sectors:
     filtered = filtered[filtered["Sector"].isin(selected_sectors)]
 
-# ------------- Top metrics -------------
+
+# ===================== Top metrics ===========================================
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
@@ -372,7 +396,9 @@ with col3:
     else:
         st.write("N/A")
 
-# ------------- Charts -------------
+
+# ===================== Charts ================================================
+
 if filtered.empty:
     st.warning("No clients after applying filters.")
 else:
@@ -394,27 +420,28 @@ else:
 
     st.subheader("Average Risk by Country")
     country_group = (
-        filtered.groupby("CountryRaw", as_index=False)["RiskScore"]
+        filtered.groupby("Country", as_index=False)["RiskScore"]
         .mean()
         .sort_values("RiskScore", ascending=False)
     )
     fig_country = px.bar(
         country_group,
-        x="CountryRaw",
+        x="Country",
         y="RiskScore",
-        labels={"RiskScore": "Avg Risk Score", "CountryRaw": "Country"},
+        labels={"RiskScore": "Avg Risk Score"},
         title="Average Client Risk by Country",
     )
     st.plotly_chart(fig_country, use_container_width=True)
 
-# ------------- Table -------------
+
+# ===================== Table ==================================================
+
 st.subheader("Client-Level Detail")
-filtered = filtered.rename(columns={"CountryRaw": "Country"})
 
-show_cols = ["Client", "Country", "BaseRisk", "Sector",
-             "Macro_Adj", "WB_CountryRisk", "RiskScore"]
-
-available_cols = [c for c in show_cols if c in filtered.columns]
+desired_cols = [
+    "Client", "Country", "BaseRisk", "Sector",
+    "Macro_Adj", "WB_CountryRisk", "RiskScore"
+]
+available_cols = [c for c in desired_cols if c in filtered.columns]
 
 st.dataframe(filtered[available_cols], use_container_width=True)
-
