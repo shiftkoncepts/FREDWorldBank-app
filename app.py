@@ -12,7 +12,7 @@ st.markdown(
     """
 Upload a client dataset and explore risk by **country** and **sector**.
 
-**RiskScore = BaseRisk + FRED macro adjustment (applied to US clients) + World Bank–style country risk (optional).**
+**RiskScore = BaseRisk + Sector-specific FRED macro adjustment (US clients) + World Bank–style country risk (optional).**
 
 Your file should contain:
 
@@ -27,31 +27,94 @@ Your file should contain:
 """
 )
 
-# ---------- FRED integration (for US macro) ----------
+# ---------- FRED: overall snapshot for US macro ----------
 @st.cache_data
-def get_fred_macro():
-    """Fetch macro indicators from FRED and create a simple 'macro stress' score."""
+def get_fred_overall():
+    """Overall US macro snapshot (for display only)."""
     fred = Fred(api_key=st.secrets["FRED_API_KEY"])
 
-    nfcfi = fred.get_series("NFCI")      # Chicago Fed National Financial Conditions Index
-    unrate = fred.get_series("UNRATE")   # US Unemployment Rate
+    nfcfi = fred.get_series("NFCI")      # Financial Conditions Index
+    unrate = fred.get_series("UNRATE")   # Unemployment rate
 
     recent_nfcfi = float(nfcfi.iloc[-1])
     recent_unrate = float(unrate.iloc[-1])
 
-    # Demo formula (tweak later if you like)
-    macro_stress = (recent_nfcfi + (recent_unrate / 10.0)) / 2.0
-
     return {
-        "macro_stress": macro_stress,
         "nfcfi": recent_nfcfi,
         "unrate": recent_unrate,
     }
 
+
+# ---------- FRED: sector-specific series ----------
+# For each broad sector label, choose a FRED series + whether "high is good" or "high is bad".
+FRED_SECTOR_INFO = {
+    "Manufacturing":                   {"series": "INDPRO",      "good_high": True},   # Industrial production
+    "Retail Trade":                    {"series": "RSXFS",       "good_high": True},   # Retail sales excl. autos
+    "Wholesale Trade":                 {"series": "RSXFS",       "good_high": True},   # Approx by retail activity
+    "Finance & Insurance":             {"series": "STLFSI4",     "good_high": False},  # Financial stress index
+    "Information":                     {"series": "INDPRO",      "good_high": True},   # Use broad production proxy
+    "Construction":                    {"series": "HOUST",       "good_high": True},   # Housing starts
+    "Real Estate & Rental":            {"series": "HOUST",       "good_high": True},   # Same as construction
+    "Natural Resources & Mining":      {"series": "IPMINE",      "good_high": True},   # Mining industrial production
+    "Transportation & Warehousing":    {"series": "TSIFRGHT",    "good_high": True},   # Freight TSI
+    "Education & Healthcare":          {"series": "CPIMEDSL",    "good_high": False},  # Medical CPI (high = stress)
+    "Admin & Support":                 {"series": "UNRATE",      "good_high": False},  # Labor market slack
+    "Professional, Scientific & Technical": {"series": "INDPRO", "good_high": True},
+    "Management of Companies":         {"series": "INDPRO",      "good_high": True},
+    "Arts, Entertainment & Accommodation": {"series": "UNRATE",  "good_high": False},
+    "Other Services & Public Admin":   {"series": "UNRATE",      "good_high": False},
+    "Utilities":                       {"series": "INDPRO",      "good_high": True},
+}
+
+
+@st.cache_data
+def get_sector_stress(series_id: str, good_high: bool) -> float:
+    """
+    Get a sector stress score from a FRED time series.
+
+    Steps:
+    - Pull the full series.
+    - Compute z-score of the latest value vs history.
+    - If 'good_high' is True, invert sign so high activity = lower stress.
+    - Cap to [-3, 3] to avoid extreme outliers.
+    """
+    try:
+        fred = Fred(api_key=st.secrets["FRED_API_KEY"])
+    except Exception:
+        return 0.0
+
+    try:
+        series = fred.get_series(series_id)
+    except Exception:
+        return 0.0
+
+    s = series.dropna()
+    if len(s) < 10:
+        return 0.0
+
+    last = s.iloc[-1]
+    mean = s.mean()
+    std = s.std()
+    if std == 0 or pd.isna(std):
+        return 0.0
+
+    z = (last - mean) / std
+    # If high values are good (e.g., more production), then high = low stress.
+    if good_high:
+        stress = -z
+    else:
+        stress = z
+
+    # Cap the stress to keep it reasonable
+    stress = float(max(min(stress, 3.0), -3.0))
+    return stress
+
+
+# Try to get overall FRED info (for metrics).
 try:
-    fred_data = get_fred_macro()
+    fred_overall = get_fred_overall()
 except Exception:
-    fred_data = None
+    fred_overall = None
 
 
 # ---------- File upload / sample fallback ----------
@@ -68,7 +131,7 @@ else:
     st.sidebar.info("No file uploaded — using a 10-client US/China example.")
     df = pd.DataFrame({
         "Client": [
-            "Google", "Apple", "Ford", "Goldman Sachs", "UnitedHealth",
+            "Google", "Apple", "Ford Motor", "Goldman Sachs", "UnitedHealth",
             "Alibaba", "Tencent", "Evergrande", "PetroChina", "BYD"
         ],
         "Country": ["US", "US", "US", "US", "US", "CN", "CN", "CN", "CN", "CN"],
@@ -151,114 +214,4 @@ if "NAICS" not in df.columns and "SIC" not in df.columns:
     st.stop()
 
 # Optional World Bank country risk column
-if "WB_CountryRisk" not in df.columns:
-    df["WB_CountryRisk"] = 0.0
-
-# ---------- Derive sector and apply risk logic ----------
-df["Sector"] = df.apply(infer_sector, axis=1)
-
-# Normalize types
-df["Country"] = df["Country"].astype(str)
-df["BaseRisk"] = pd.to_numeric(df["BaseRisk"], errors="coerce").fillna(0.0)
-df["WB_CountryRisk"] = pd.to_numeric(df["WB_CountryRisk"], errors="coerce").fillna(0.0)
-
-# FRED macro adjustment for US clients only
-if fred_data is not None:
-    macro_stress = fred_data["macro_stress"]
-    df["Macro_Adj"] = np.where(df["Country"].str.upper() == "US", macro_stress * 10.0, 0.0)
-else:
-    df["Macro_Adj"] = 0.0
-
-# Final RiskScore
-df["RiskScore"] = df["BaseRisk"] + df["Macro_Adj"] + df["WB_CountryRisk"]
-
-
-# ---------- Filters (by country and sector) ----------
-st.sidebar.header("Filters")
-
-all_countries = sorted(df["Country"].unique().tolist())
-selected_countries = st.sidebar.multiselect(
-    "Countries",
-    options=all_countries,
-    default=all_countries,
-)
-
-filtered = df.copy()
-if selected_countries:
-    filtered = filtered[filtered["Country"].isin(selected_countries)]
-
-available_sectors = sorted(filtered["Sector"].dropna().unique().tolist())
-selected_sectors = st.sidebar.multiselect(
-    "Sectors (NAICS / SIC groups)",
-    options=available_sectors,
-    default=available_sectors
-)
-
-if selected_sectors:
-    filtered = filtered[filtered["Sector"].isin(selected_sectors)]
-
-
-# ---------- Top-Level Metrics ----------
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.subheader("Clients")
-    st.metric("Total (filtered)", len(filtered))
-    if not filtered.empty:
-        st.metric("Avg RiskScore", f"{filtered['RiskScore'].mean():.1f}")
-
-with col2:
-    st.subheader("FRED – US Macro (used for US clients)")
-    if fred_data:
-        st.metric("NFCI", f"{fred_data['nfcfi']:.3f}")
-        st.metric("UNRATE", f"{fred_data['unrate']:.2f}%")
-    else:
-        st.info("FRED API key not configured.")
-
-with col3:
-    st.subheader("World Bank Country Risk (all countries)")
-    if not filtered.empty:
-        avg_country_risk = filtered["WB_CountryRisk"].mean()
-        st.metric("Avg WB_CountryRisk", f"{avg_country_risk:.1f}")
-    else:
-        st.write("N/A")
-
-
-# ---------- Charts ----------
-if filtered.empty:
-    st.warning("No clients after applying filters.")
-else:
-    st.subheader("Average Risk by Sector")
-    sector_group = (
-        filtered.groupby("Sector", as_index=False)["RiskScore"]
-        .mean()
-        .sort_values("RiskScore", ascending=False)
-    )
-    fig_sector = px.bar(
-        sector_group,
-        x="Sector",
-        y="RiskScore",
-        labels={"RiskScore": "Avg Risk Score"},
-        title="Average Client Risk by Sector",
-    )
-    fig_sector.update_layout(xaxis_tickangle=-30)
-    st.plotly_chart(fig_sector, use_container_width=True)
-
-    st.subheader("Average Risk by Country")
-    country_group = (
-        filtered.groupby("Country", as_index=False)["RiskScore"]
-        .mean()
-        .sort_values("RiskScore", ascending=False)
-    )
-    fig_country = px.bar(
-        country_group,
-        x="Country",
-        y="RiskScore",
-        labels={"RiskScore": "Avg Risk Score"},
-        title="Average Client Risk by Country",
-    )
-    st.plotly_chart(fig_country, use_container_width=True)
-
-# ---------- Table ----------
-st.subheader("Client-Level Detail")
-st.dataframe(filtered, use_container_width=True)
+if "WB_Coun_
