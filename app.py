@@ -409,8 +409,12 @@ else:
 
 # ------------- Table -------------
 st.subheader("Client-Level Detail")
-show_cols = ["Client", "CountryRaw", "BaseRisk", "Sector",
-             "Macro_Adj", "WB_CountryRisk", "RiskScore"]
-show_cols = [c for c in show_cols if c in filtered.columns]
 filtered = filtered.rename(columns={"CountryRaw": "Country"})
-st.dataframe(filtered[show_cols], use_container_width=True)
+
+show_cols = ["Client", "Country", "BaseRisk", "Sector",
+             "Macro_Adj", "WB_CountryRisk", "RiskScore"]
+
+available_cols = [c for c in show_cols if c in filtered.columns]
+
+st.dataframe(filtered[available_cols], use_container_width=True)
+
