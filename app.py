@@ -4,23 +4,30 @@ import numpy as np
 import plotly.express as px
 from fredapi import Fred
 
-st.set_page_config(page_title="Client Risk Dashboard", layout="wide")
+st.set_page_config(page_title="Client Risk Analyzer – Global", layout="wide")
 
-st.title("Client Risk Explorer – US vs Foreign 🌍")
+st.title("Client Risk Analyzer – Global 🌍")
 
 st.markdown(
     """
-Upload a client file or use the sample dataset.  
+Upload a client dataset and explore risk by **country** and **sector**.
 
-**RiskScore = BaseRisk + FRED macro adjustment (US only) + World Bank–style country risk.**
+**RiskScore = BaseRisk + FRED macro adjustment (applied to US clients) + World Bank–style country risk (optional).**
 
-- **BaseRisk** = your internal client risk (DSO, AR, disputes, etc.)
-- **FRED macro** = US-wide macro stress factor
-- **WB_CountryRisk** = country risk score derived from World Bank data (you provide this as a column).
+Your file should contain:
+
+**Required columns**
+- `Client` – client name  
+- `Country` – country code or name (e.g. US, CN, UK…)  
+- `BaseRisk` – internal client risk score (0–100 or your own scale)  
+- One of: `NAICS` **or** `SIC` – industry classification  
+
+**Optional**
+- `WB_CountryRisk` – numeric country risk score (e.g. derived from World Bank indicators)
 """
 )
 
-# ---------- FRED integration ----------
+# ---------- FRED integration (for US macro) ----------
 @st.cache_data
 def get_fred_macro():
     """Fetch macro indicators from FRED and create a simple 'macro stress' score."""
@@ -32,7 +39,7 @@ def get_fred_macro():
     recent_nfcfi = float(nfcfi.iloc[-1])
     recent_unrate = float(unrate.iloc[-1])
 
-    # Demo formula (replace with your own scaling later)
+    # Demo formula (tweak later if you like)
     macro_stress = (recent_nfcfi + (recent_unrate / 10.0)) / 2.0
 
     return {
@@ -41,14 +48,13 @@ def get_fred_macro():
         "unrate": recent_unrate,
     }
 
-# Load FRED data
 try:
     fred_data = get_fred_macro()
 except Exception:
     fred_data = None
 
 
-# ---------- File upload / sample data ----------
+# ---------- File upload / sample fallback ----------
 st.sidebar.header("Data Source")
 
 uploaded = st.sidebar.file_uploader("Upload CSV or Excel client file", type=["csv", "xlsx"])
@@ -59,92 +65,131 @@ if uploaded is not None:
     else:
         df = pd.read_excel(uploaded)
 else:
-    st.sidebar.info("No file uploaded — using 10-client US/China sample with WB country risk.")
-    df = pd.read_csv("sample_clients_wb.csv")
+    st.sidebar.info("No file uploaded — using a 10-client US/China example.")
+    df = pd.DataFrame({
+        "Client": [
+            "Google", "Apple", "Ford", "Goldman Sachs", "UnitedHealth",
+            "Alibaba", "Tencent", "Evergrande", "PetroChina", "BYD"
+        ],
+        "Country": ["US", "US", "US", "US", "US", "CN", "CN", "CN", "CN", "CN"],
+        "NAICS": [519130, 334111, 336110, 523110, 621111, 454110, 511210, 236220, 211120, 336320],
+        "BaseRisk": [35.2, 22.8, 48.1, 40.6, 25.4, 55.3, 38.7, 92.4, 67.9, 44.2],
+        # Example World Bank–style country risk scores
+        "WB_CountryRisk": [8.0, 8.0, 8.0, 8.0, 8.0, 18.0, 18.0, 25.0, 18.0, 18.0],
+    })
 
 
-# ---------- NAICS to Sector Mapping ----------
-def map_naics_to_sector(naics_code):
-    try:
-        code2 = int(str(int(naics_code))[:2])
-    except (ValueError, TypeError):
-        return "Unknown"
-
-    if 11 <= code2 <= 21:
+# ---------- Sector mapping helpers (NAICS or SIC) ----------
+def sector_from_two_digit(code2: int) -> str:
+    """Map a 2-digit industry code (NAICS or SIC group) to a broad sector label."""
+    if 1 <= code2 <= 9 or 10 <= code2 <= 14 or 11 <= code2 <= 21:
         return "Natural Resources & Mining"
-    elif code2 == 22:
+    if code2 == 22:
         return "Utilities"
-    elif code2 == 23:
+    if code2 == 23 or 15 <= code2 <= 17:
         return "Construction"
-    elif 31 <= code2 <= 33:
+    if 31 <= code2 <= 33 or 20 <= code2 <= 39:
         return "Manufacturing"
-    elif code2 == 42:
+    if code2 == 42 or 50 <= code2 <= 51:
         return "Wholesale Trade"
-    elif 44 <= code2 <= 45:
+    if 44 <= code2 <= 45 or 52 <= code2 <= 59:
         return "Retail Trade"
-    elif 48 <= code2 <= 49:
+    if 48 <= code2 <= 49:
         return "Transportation & Warehousing"
-    elif code2 == 51:
+    if code2 == 51 or code2 == 48:
         return "Information"
-    elif code2 == 52:
+    if code2 == 52 or 60 <= code2 <= 67:
         return "Finance & Insurance"
-    elif code2 == 53:
+    if code2 == 53 or 65 <= code2 <= 67:
         return "Real Estate & Rental"
-    elif code2 == 54:
+    if code2 == 54 or 70 <= code2 <= 73:
         return "Professional, Scientific & Technical"
-    elif code2 == 55:
+    if code2 == 55:
         return "Management of Companies"
-    elif code2 == 56:
+    if code2 == 56 or 72 <= code2 <= 73:
         return "Admin & Support"
-    elif 61 <= code2 <= 62:
+    if 61 <= code2 <= 62 or 80 <= code2 <= 89:
         return "Education & Healthcare"
-    elif 71 <= code2 <= 72:
+    if 71 <= code2 <= 72 or 78 <= code2 <= 79:
         return "Arts, Entertainment & Accommodation"
-    elif 81 <= code2 <= 92:
+    if 81 <= code2 <= 92 or 90 <= code2 <= 99:
         return "Other Services & Public Admin"
-    else:
-        return "Other / Unknown"
+    return "Other / Unknown"
 
 
-required_cols = ["Client", "Country", "NAICS", "BaseRisk", "WB_CountryRisk"]
-missing = [c for c in required_cols if c not in df.columns]
-if missing:
-    st.error(f"Your data is missing required columns: {missing}")
+def infer_sector(row):
+    """Use NAICS if present, otherwise SIC, to derive a sector."""
+    # Prefer NAICS if available
+    if "NAICS" in row and not pd.isna(row["NAICS"]):
+        try:
+            code2 = int(str(int(row["NAICS"]))[:2])
+            return sector_from_two_digit(code2)
+        except Exception:
+            pass
+
+    # Fallback to SIC
+    if "SIC" in row and not pd.isna(row["SIC"]):
+        try:
+            code2 = int(str(int(row["SIC"]))[:2])
+            return sector_from_two_digit(code2)
+        except Exception:
+            pass
+
+    return "Other / Unknown"
+
+
+# ---------- Validate minimal required cols ----------
+base_required = ["Client", "Country", "BaseRisk"]
+missing_basic = [c for c in base_required if c not in df.columns]
+
+if missing_basic:
+    st.error(f"Your data is missing required columns: {missing_basic}")
     st.stop()
 
-# Derive Sector + Region
-df["Sector"] = df["NAICS"].apply(map_naics_to_sector)
-df["Region"] = np.where(df["Country"].str.upper() == "US", "US", "Foreign")
+if "NAICS" not in df.columns and "SIC" not in df.columns:
+    st.error("Your data must contain either a `NAICS` column or a `SIC` column.")
+    st.stop()
 
+# Optional World Bank country risk column
+if "WB_CountryRisk" not in df.columns:
+    df["WB_CountryRisk"] = 0.0
 
-# ---------- Macro Adjustment for US Clients ----------
+# ---------- Derive sector and apply risk logic ----------
+df["Sector"] = df.apply(infer_sector, axis=1)
+
+# Normalize types
+df["Country"] = df["Country"].astype(str)
+df["BaseRisk"] = pd.to_numeric(df["BaseRisk"], errors="coerce").fillna(0.0)
+df["WB_CountryRisk"] = pd.to_numeric(df["WB_CountryRisk"], errors="coerce").fillna(0.0)
+
+# FRED macro adjustment for US clients only
 if fred_data is not None:
     macro_stress = fred_data["macro_stress"]
-    df["Macro_Adj"] = np.where(df["Region"] == "US", macro_stress * 10.0, 0.0)
+    df["Macro_Adj"] = np.where(df["Country"].str.upper() == "US", macro_stress * 10.0, 0.0)
 else:
     df["Macro_Adj"] = 0.0
-
-# Ensure WB_CountryRisk is numeric
-df["WB_CountryRisk"] = pd.to_numeric(df["WB_CountryRisk"], errors="coerce").fillna(0.0)
 
 # Final RiskScore
 df["RiskScore"] = df["BaseRisk"] + df["Macro_Adj"] + df["WB_CountryRisk"]
 
 
-# ---------- Filters ----------
+# ---------- Filters (by country and sector) ----------
 st.sidebar.header("Filters")
 
-region_choice = st.sidebar.radio("Client Region", ["All", "US only", "Foreign only"])
+all_countries = sorted(df["Country"].unique().tolist())
+selected_countries = st.sidebar.multiselect(
+    "Countries",
+    options=all_countries,
+    default=all_countries,
+)
 
 filtered = df.copy()
-if region_choice == "US only":
-    filtered = filtered[filtered["Region"] == "US"]
-elif region_choice == "Foreign only":
-    filtered = filtered[filtered["Region"] == "Foreign"]
+if selected_countries:
+    filtered = filtered[filtered["Country"].isin(selected_countries)]
 
 available_sectors = sorted(filtered["Sector"].dropna().unique().tolist())
 selected_sectors = st.sidebar.multiselect(
-    "Sectors (NAICS Groups)",
+    "Sectors (NAICS / SIC groups)",
     options=available_sectors,
     default=available_sectors
 )
@@ -157,11 +202,13 @@ if selected_sectors:
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.subheader("Client Counts")
+    st.subheader("Clients")
     st.metric("Total (filtered)", len(filtered))
+    if not filtered.empty:
+        st.metric("Avg RiskScore", f"{filtered['RiskScore'].mean():.1f}")
 
 with col2:
-    st.subheader("FRED Indicators")
+    st.subheader("FRED – US Macro (used for US clients)")
     if fred_data:
         st.metric("NFCI", f"{fred_data['nfcfi']:.3f}")
         st.metric("UNRATE", f"{fred_data['unrate']:.2f}%")
@@ -169,7 +216,7 @@ with col2:
         st.info("FRED API key not configured.")
 
 with col3:
-    st.subheader("World Bank Country Risk")
+    st.subheader("World Bank Country Risk (all countries)")
     if not filtered.empty:
         avg_country_risk = filtered["WB_CountryRisk"].mean()
         st.metric("Avg WB_CountryRisk", f"{avg_country_risk:.1f}")
@@ -178,29 +225,39 @@ with col3:
 
 
 # ---------- Charts ----------
-st.subheader("Average Risk by Sector & Region")
-
 if filtered.empty:
-    st.warning("No clients after filtering.")
+    st.warning("No clients after applying filters.")
 else:
-    grouped = (
-        filtered
-        .groupby(["Region", "Sector"], as_index=False)["RiskScore"]
+    st.subheader("Average Risk by Sector")
+    sector_group = (
+        filtered.groupby("Sector", as_index=False)["RiskScore"]
         .mean()
+        .sort_values("RiskScore", ascending=False)
     )
-
-    fig = px.bar(
-        grouped,
+    fig_sector = px.bar(
+        sector_group,
         x="Sector",
         y="RiskScore",
-        color="Region",
-        barmode="group",
-        title="Average Client Risk by Sector & Region",
-        labels={"RiskScore": "Risk Score"}
+        labels={"RiskScore": "Avg Risk Score"},
+        title="Average Client Risk by Sector",
     )
-    fig.update_layout(xaxis_tickangle=-30)
-    st.plotly_chart(fig, use_container_width=True)
+    fig_sector.update_layout(xaxis_tickangle=-30)
+    st.plotly_chart(fig_sector, use_container_width=True)
 
+    st.subheader("Average Risk by Country")
+    country_group = (
+        filtered.groupby("Country", as_index=False)["RiskScore"]
+        .mean()
+        .sort_values("RiskScore", ascending=False)
+    )
+    fig_country = px.bar(
+        country_group,
+        x="Country",
+        y="RiskScore",
+        labels={"RiskScore": "Avg Risk Score"},
+        title="Average Client Risk by Country",
+    )
+    st.plotly_chart(fig_country, use_container_width=True)
 
 # ---------- Table ----------
 st.subheader("Client-Level Detail")
