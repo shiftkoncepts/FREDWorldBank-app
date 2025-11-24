@@ -3,4 +3,5 @@ pandas
 numpy
 plotly
 fredapi
+requests
 openpyxl
